@@ -176,6 +176,16 @@ loss.atriplet.triplet_max_ap = 0.0
 loss.atriplet.per_batch_size = 60
 loss.atriplet.lr = 0.05
 
+loss.Curricular = edict()
+loss.Curricular.loss_name = 'Curricular'
+loss.Curricular.loss_s = 64.0
+loss.Curricular.loss_m1 = 1.0
+loss.Curricular.loss_m2 = 0.5
+loss.Curricular.loss_m3 = 0.0
+
+loss.Circle = edict()
+loss.Circle.loss_name = 'Circle'
+
 # default settings
 default = edict()
 

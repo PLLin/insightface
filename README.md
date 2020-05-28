@@ -1,3 +1,7 @@
+# Modify Part
+1. Add Circle loss [Paper](https://arxiv.org/abs/2002.10857)
+2. Add CurricularFace [Paper](https://arxiv.org/abs/2004.00288)
+3. Add mxboard to training process
 
 # InsightFace: 2D and 3D Face Analysis Project
 

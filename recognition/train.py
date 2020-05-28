@@ -27,8 +27,7 @@ import fmobilenet
 import fmnasnet
 import fdensenet
 import vargfacenet
-
-
+from mxboard import SummaryWriter
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -57,6 +56,10 @@ def parse_args():
   parser.add_argument('--frequent', type=int, default=default.frequent, help='')
   parser.add_argument('--per-batch-size', type=int, default=default.per_batch_size, help='batch size in each context')
   parser.add_argument('--kvstore', type=str, default=default.kvstore, help='kvstore setting')
+
+  parser.add_argument('--log-board', type=bool, default=True, help='use mxboard')
+  parser.add_argument('--log-board-step', type=int, default=500, help='how many steps each time to log loss to mxboard')
+
   args = parser.parse_args()
   return args
 
@@ -128,6 +131,79 @@ def get_symbol(args):
       triplet_loss = mx.symbol.Activation(data = (ap-an+config.triplet_alpha), act_type='relu')
       triplet_loss = mx.symbol.mean(triplet_loss)
     triplet_loss = mx.symbol.MakeLoss(triplet_loss)
+  elif config.loss_name=='Circle':
+    _weight = mx.symbol.Variable("fc7_weight", shape=(config.num_classes, config.emb_size),
+        lr_mult=config.fc7_lr_mult, wd_mult=config.fc7_wd_mult, init=mx.init.Normal(0.01))
+    m = 0.25
+    gamma = 256
+    delta_p = 1 - m
+    delta_n = m
+    nembedding = mx.symbol.L2Normalization(embedding, mode='instance', name='fc1n')
+    fc7 = mx.sym.FullyConnected(data=nembedding*64, weight = _weight, no_bias = True, num_hidden=config.num_classes, name='fc7')
+    nembedding_t = mx.symbol.transpose(nembedding)
+    sim_mat = mx.symbol.dot(nembedding, nembedding_t)
+    gt_one_hot = mx.sym.one_hot(gt_label, depth = config.num_classes, on_value = 1.0, off_value = 0.0)
+    gt_one_hot_t = mx.symbol.transpose(gt_one_hot)
+    gt_mat = mx.symbol.dot(gt_one_hot, gt_one_hot_t)
+    sim_up_vec = mx.symbol.linalg.extracttrian(sim_mat, 1)
+    pos_gt_vec = mx.symbol.linalg.extracttrian(gt_mat, 1)
+    neg_gt_vec = mx.sym.elemwise_sub(mx.symbol.ones_like(pos_gt_vec), pos_gt_vec)
+    sp = mx.symbol.contrib.boolean_mask(sim_up_vec, pos_gt_vec)
+    sn = mx.symbol.contrib.boolean_mask(sim_up_vec, neg_gt_vec)
+    ap = mx.symbol.elemwise_sub(mx.symbol.ones_like(sp)*(1+m), sp)
+    an = mx.symbol.elemwise_add(mx.symbol.ones_like(sn)*(m), sn)
+    ap = mx.symbol.clip(ap, a_min=0, a_max=99999)
+    an =  mx.symbol.clip(an, a_min=0, a_max=99999)
+    logit_p =  mx.symbol.elemwise_mul(ap, (sp - delta_p))*(-gamma)
+    logit_n =  mx.symbol.elemwise_mul(an, (sn - delta_n))*gamma
+    logsumexp_p = mx.symbol.log(mx.symbol.sum(mx.symbol.exp(logit_p)))
+    logsumexp_n = mx.symbol.log(mx.symbol.sum(mx.symbol.exp(logit_n)))
+    circle_loss = mx.symbol.Activation(logsumexp_p + logsumexp_n, act_type='softrelu')
+    circle_loss = mx.symbol.MakeLoss(circle_loss)
+  elif config.loss_name=='Curricular':
+    _weight = mx.symbol.Variable("fc7_weight", shape=(config.num_classes, config.emb_size),
+        lr_mult=config.fc7_lr_mult, wd_mult=config.fc7_wd_mult, init=mx.init.Normal(0.01))
+    s = config.loss_s
+    _weight = mx.symbol.L2Normalization(_weight, mode='instance')
+    nembedding = mx.symbol.L2Normalization(embedding, mode='instance', name='fc1n')*s
+    fc7 = mx.sym.FullyConnected(data=nembedding, weight = _weight, no_bias = True, num_hidden=config.num_classes, name='fc7')
+    if config.loss_m1!=1.0 or config.loss_m2!=0.0 or config.loss_m3!=0.0:
+      if config.loss_m1==1.0 and config.loss_m2==0.0:
+        s_m = s*config.loss_m3
+        gt_one_hot = mx.sym.one_hot(gt_label, depth = config.num_classes, on_value = s_m, off_value = 0.0)
+        fc7 = fc7-gt_one_hot
+      else:
+        zy = mx.sym.pick(fc7, gt_label, axis=1)
+        cos_t = zy/s
+        t = mx.sym.arccos(cos_t)
+        if config.loss_m1!=1.0:
+          t = t*config.loss_m1
+        if config.loss_m2>0.0:
+          t = t+config.loss_m2
+        body = mx.sym.cos(t)
+        if config.loss_m3>0.0:
+          body = body - config.loss_m3
+        new_zy = body*s
+        diff = new_zy - zy
+        diff = mx.sym.expand_dims(diff, 1)
+        gt_one_hot = mx.sym.one_hot(gt_label, depth = config.num_classes, on_value = 1.0, off_value = 0.0)
+        body = mx.sym.broadcast_mul(gt_one_hot, diff)
+
+        cos_t_mean = mx.symbol.mean(cos_t)
+        fc7_cos_t = fc7/s
+        cos_t = mx.sym.expand_dims(cos_t, 1)
+        cos_t = mx.sym.broadcast_axis(cos_t, axis=1, size=config.num_classes)
+        cond_v = fc7_cos_t - cos_t
+        cond = mx.symbol.Activation(data=cond_v, act_type='relu')
+        _t = mx.sym.Variable("_t", init=mx.initializer.Zero())
+        _t = mx.sym.stop_gradient(cos_t_mean*0.01+_t*0.99)
+        _t_one_hot =  mx.sym.broadcast_mul(mx.symbol.ones_like(cond), _t)
+        a1 = mx.sym.elemwise_mul(_t_one_hot, cond)
+        a2 = mx.sym.elemwise_mul(cond + a1, cond)
+        a3 = mx.sym.elemwise_sub(a2, cond)
+        body2 = a3 * s
+        fc7 = fc7+body+body2
+
   out_list = [mx.symbol.BlockGrad(embedding)]
   if is_softmax:
     softmax = mx.symbol.SoftmaxOutput(data=fc7, label = gt_label, name='softmax', normalization='valid')
@@ -140,6 +216,10 @@ def get_symbol(args):
       body = body*_label
       ce_loss = mx.symbol.sum(body)/args.per_batch_size
       out_list.append(mx.symbol.BlockGrad(ce_loss))
+  elif  config.loss_name=='Circle':
+    softmax = mx.symbol.SoftmaxOutput(data=fc7, label = gt_label, name='softmax', normalization='valid')
+    out_list.append(softmax)
+    out_list.append(mx.symbol.BlockGrad(circle_loss))
   else:
     out_list.append(mx.sym.BlockGrad(gt_label))
     out_list.append(triplet_loss)
@@ -195,6 +275,13 @@ def train_net(args):
       print('loading', args.pretrained, args.pretrained_epoch)
       _, arg_params, aux_params = mx.model.load_checkpoint(args.pretrained, args.pretrained_epoch)
       sym = get_symbol(args)
+
+    if args.log_board:
+      log_dir = os.path.join(prefix_dir, 'logs')
+      if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+      sw = SummaryWriter(logdir=log_dir, flush_secs=5)
+      sw.add_graph(sym)
 
     if config.count_flops:
       all_layers = sym.get_internals()
@@ -302,6 +389,14 @@ def train_net(args):
       if mbatch%1000==0:
         print('lr-batch-epoch:',opt.lr,param.nbatch,param.epoch)
 
+      if args.log_board and mbatch%args.log_board_step==0:
+        sw.add_scalar(tag='lr', value=opt.lr, global_step=global_step[0])
+        _, val_acc = metric1.get()
+        sw.add_scalar(tag='val_acc', value=val_acc, global_step=global_step[0])
+        if config.ce_loss:
+          _, ce_loss = metric2.get()
+          sw.add_scalar(tag='ce_loss', value=ce_loss, global_step=global_step[0])
+
       if mbatch>=0 and mbatch%args.verbose==0:
         acc_list = ver_test(mbatch)
         save_step[0]+=1
@@ -333,6 +428,9 @@ def train_net(args):
           do_save = True
         elif args.ckpt==3:
           msave = 1
+        if args.log_board:
+          for i in range(len(acc_list)):
+            sw.add_scalar(tag=ver_name_list[i]+'_acc', value=acc_list[i], global_step=global_step[0])
 
         if do_save:
           print('saving', msave)
